@@ -1,0 +1,89 @@
+#  Install required packages
+!pip install transformers datasets accelerate --upgrade
+
+#  Imports
+import torch
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainingArguments,
+    Trainer,
+)
+from datasets import load_dataset
+
+#  Load the dataset (only the Python subset of CodeSearchNet)
+dataset = load_dataset("code_search_net", "python", split="train[:1%]")
+
+#  Check available fields and print the first example to see the structure
+print("Available fields:", dataset.column_names)
+print("\nFirst example:", dataset[0])
+
+# Based on the CodeSearchNet dataset structure, the code is in the 'whole_func_string' field
+# Let's rename it to 'code' for clarity
+dataset = dataset.rename_column("whole_func_string", "code")
+
+#  Load CodeLLaMA tokenizer & model
+model_id = "Salesforce/codegen-350M-mono"  # smaller model, easier to fine-tune
+
+tokenizer = AutoTokenizer.from_pretrained(model_id)
+tokenizer.pad_token = tokenizer.eos_token  # Make sure padding token is set
+model = AutoModelForCausalLM.from_pretrained(model_id)
+
+#  Tokenization
+def tokenize(example):
+    return tokenizer(
+        example["code"],
+        truncation=True,
+        max_length=512,
+        padding="max_length"
+    )
+
+tokenized_dataset = dataset.map(tokenize, batched=True, remove_columns=dataset.column_names)
+tokenized_dataset.set_format(type="torch")
+
+# Add labels (required for causal LM fine-tuning)
+tokenized_dataset = tokenized_dataset.map(lambda e: {"labels": e["input_ids"]})
+
+#  Training arguments
+training_args = TrainingArguments(
+    output_dir="./codellama-finetuned",
+    per_device_train_batch_size=2,
+    num_train_epochs=3,
+    logging_steps=10,
+    save_steps=100,
+    save_total_limit=1,
+    fp16=torch.cuda.is_available(),
+    evaluation_strategy="no",
+    report_to="none"
+)
+
+# Trainer
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_dataset
+)
+
+#  Train
+trainer.train()
+
+# Save
+model.save_pretrained("./codellama-finetuned")
+tokenizer.save_pretrained("./codellama-finetuned")
+
+prompt = "def fibonacci(n):"
+inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+# Generate code
+outputs = model.generate(
+    **inputs,
+    max_new_tokens=100,
+    do_sample=True,     # enables randomness for creativity
+    top_k=50,           # limits sampling pool to top k tokens
+    top_p=0.95,         # nucleus sampling
+    temperature=0.7,    # controls randomness (lower = more focused)
+    eos_token_id=tokenizer.eos_token_id
+)
+
+generated_code = tokenizer.decode(outputs[0], skip_special_tokens=True)
+print(generated_code)
